@@ -9,6 +9,7 @@ from .paths import (
     resolve_archive_path,
     resolve_hash_path,
     get_archive_basename,
+    resolve_truncated_paths,
 )
 from .validator import (
     ZipValidationError,
@@ -18,6 +19,7 @@ from .validator import (
     read_expected_hash,
 )
 from .logging_setup import setup_logging, get_logger
+from .truncate import truncate_archive, extract_and_hash_members, write_metadata_json
 
 
 def cmd_truncate(args):
@@ -52,7 +54,43 @@ def cmd_truncate(args):
         return 1
 
     logger.info(f"Truncation validated: will remove {args.remove} bytes")
-    logger.info("truncation logic to be implemented >.<")
+
+    archive_basename = get_archive_basename(args.archive)
+
+    try:
+        paths = resolve_truncated_paths(archive_basename)
+    except PathSecurityError as e:
+        logger.error(str(e))
+        return 1
+
+    logger.info(f"Output truncated ZIP: {paths['truncated_zip']}")
+    logger.info(f"Output metadata JSON: {paths['truncated_json']}")
+    logger.info(f"Output sidecar dir: {paths['sidecar_dir']}")
+
+    members_hashed = extract_and_hash_members(
+        archive_path,
+        zip_info.entries,
+        paths["sidecar_dir"],
+        logger,
+    )
+
+    truncate_archive(
+        archive_path,
+        args.remove,
+        paths["truncated_zip"],
+        logger,
+    )
+
+    write_metadata_json(
+        source_archive=args.archive,
+        truncated_archive=f"{paths['truncated_basename']}.zip",
+        removed_bytes=args.remove,
+        members_hashed=members_hashed,
+        json_path=paths["truncated_json"],
+        logger=logger,
+    )
+
+    logger.info(f"Truncation complete: {members_hashed} members hashed")
 
     return 0
 

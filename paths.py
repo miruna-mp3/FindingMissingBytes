@@ -105,3 +105,22 @@ def resolve_metadata_path(archive_basename: str) -> Path:
         raise PathSecurityError(f"Path escapes workspace: {archive_basename}")
 
     return path
+
+
+def resolve_truncated_paths(archive_basename: str) -> dict:
+    truncated_basename = f"{archive_basename}_truncated"
+
+    truncated_zip = ARCHIVES_DIR / f"{truncated_basename}.zip"
+    truncated_json = ARCHIVES_DIR / f"{truncated_basename}.json"
+    sidecar_dir = ARCHIVES_DIR / truncated_basename
+
+    for path in [truncated_zip, truncated_json, sidecar_dir]:
+        if not is_path_safe(path, ARCHIVES_DIR):
+            raise PathSecurityError(f"Path escapes workspace: {archive_basename}")
+
+    return {
+        "truncated_zip": truncated_zip,
+        "truncated_json": truncated_json,
+        "sidecar_dir": sidecar_dir,
+        "truncated_basename": truncated_basename,
+    }
