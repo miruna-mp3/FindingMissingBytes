@@ -1,5 +1,7 @@
+import hashlib
 import os
 import struct
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, List, Tuple
@@ -8,9 +10,11 @@ import time
 
 EOCD_SIGNATURE = b"PK\x05\x06"
 CD_SIGNATURE = b"PK\x01\x02"
+LFH_SIGNATURE = b"PK\x03\x04"
 
 EOCD_SIZE = 22
 CD_ENTRY_MIN_SIZE = 46
+LFH_MIN_SIZE = 30
 
 
 @dataclass
@@ -32,6 +36,21 @@ class GenerationResult:
     message: str = ""
     candidates_tested: int = 0
     cd_rejects: int = 0
+
+
+@dataclass
+class RecoveryResult:
+    success: bool
+    n_value: Optional[int] = None
+    recovered_data: Optional[bytes] = None
+    sha256_hash: Optional[str] = None
+    message: str = ""
+    candidates_tested: int = 0
+    cd_rejects: int = 0
+    lfh_rejects: int = 0
+    decompress_rejects: int = 0
+    crc_rejects: int = 0
+    hash_rejects: int = 0
 
 
 def get_disk_number(file_path: Path) -> int:
@@ -309,5 +328,243 @@ def generate_candidates(
         ],
         truncated_data=truncated_data,
         message=f"{len(all_valid_candidates)} valid candidates",
+        **total_stats,
+    )
+
+
+def build_eocd(cd_offset: int, cd_size: int, total_entries: int, disk_num: int) -> bytes:
+    return struct.pack(
+        "<4sHHHHIIH",
+        EOCD_SIGNATURE,
+        disk_num,
+        disk_num,
+        total_entries,
+        total_entries,
+        cd_size,
+        cd_offset,
+        0,
+    )
+
+
+def try_extraction(
+    candidate_data: bytes,
+    target_info: dict,
+    expected_hash: str,
+) -> Tuple[bool, Optional[bytes], str, dict]:
+    stats = {
+        "lfh_rejects": 0,
+        "decompress_rejects": 0,
+        "crc_rejects": 0,
+        "hash_rejects": 0,
+    }
+
+    lfh_offset = target_info["local_header_offset"]
+
+    if lfh_offset + LFH_MIN_SIZE > len(candidate_data):
+        stats["lfh_rejects"] = 1
+        return (False, None, "", stats)
+
+    if candidate_data[lfh_offset:lfh_offset + 4] != LFH_SIGNATURE:
+        stats["lfh_rejects"] = 1
+        return (False, None, "", stats)
+
+    try:
+        (
+            version_needed,
+            flags,
+            compression,
+            mod_time,
+            mod_date,
+            crc32,
+            compressed_size,
+            uncompressed_size,
+            filename_len,
+            extra_len,
+        ) = struct.unpack("<4xHHHHHIIIHH", candidate_data[lfh_offset:lfh_offset + LFH_MIN_SIZE])
+    except struct.error:
+        stats["lfh_rejects"] = 1
+        return (False, None, "", stats)
+
+    data_offset = lfh_offset + LFH_MIN_SIZE + filename_len + extra_len
+    cd_compressed_size = target_info["compressed_size"]
+    cd_uncompressed_size = target_info["uncompressed_size"]
+    cd_crc32 = target_info["crc32"]
+    cd_compression = target_info["compression"]
+
+    if data_offset + cd_compressed_size > len(candidate_data):
+        stats["lfh_rejects"] = 1
+        return (False, None, "", stats)
+
+    compressed_data = candidate_data[data_offset:data_offset + cd_compressed_size]
+
+    if cd_compression == 0:
+        decompressed_data = compressed_data
+    elif cd_compression == 8:
+        try:
+            decompressed_data = zlib.decompress(compressed_data, -zlib.MAX_WBITS)
+        except zlib.error:
+            stats["decompress_rejects"] = 1
+            return (False, None, "", stats)
+    else:
+        stats["decompress_rejects"] = 1
+        return (False, None, "", stats)
+
+    if len(decompressed_data) != cd_uncompressed_size:
+        stats["decompress_rejects"] = 1
+        return (False, None, "", stats)
+
+    computed_crc = zlib.crc32(decompressed_data) & 0xFFFFFFFF
+    if computed_crc != cd_crc32:
+        stats["crc_rejects"] = 1
+        return (False, None, "", stats)
+
+    hasher = hashlib.sha256()
+    hasher.update(decompressed_data)
+    computed_hash = hasher.hexdigest().lower()
+
+    if computed_hash != expected_hash.lower():
+        stats["hash_rejects"] = 1
+        return (False, None, "", stats)
+
+    return (True, decompressed_data, computed_hash, stats)
+
+
+def extraction_worker(args: Tuple) -> Tuple[bool, dict]:
+    (
+        truncated_data,
+        n_value,
+        eocd_start,
+        cd_offset,
+        cd_size,
+        total_entries,
+        disk_num,
+        target_info,
+        expected_hash,
+    ) = args
+
+    eocd = build_eocd(cd_offset, cd_size, total_entries, disk_num)
+    candidate_data = truncated_data[:eocd_start] + eocd
+
+    success, data, hash_val, stats = try_extraction(
+        candidate_data, target_info, expected_hash
+    )
+
+    if success:
+        return (True, {
+            "data": data,
+            "hash": hash_val,
+            "n_value": n_value,
+            "cd_offset": cd_offset,
+            "total_entries": total_entries,
+            "stats": stats,
+        })
+
+    return (False, {"stats": stats})
+
+
+def recover_member(
+    truncated_path: Path,
+    target_member: str,
+    expected_hash: str,
+    max_missing: int,
+    num_jobs: int,
+    logger,
+) -> RecoveryResult:
+    start_time = time.time()
+
+    gen_result = generate_candidates(
+        truncated_path, target_member, max_missing, num_jobs, logger
+    )
+
+    total_stats = {
+        "candidates_tested": gen_result.candidates_tested,
+        "cd_rejects": gen_result.cd_rejects,
+        "lfh_rejects": 0,
+        "decompress_rejects": 0,
+        "crc_rejects": 0,
+        "hash_rejects": 0,
+    }
+
+    if not gen_result.success:
+        return RecoveryResult(
+            success=False,
+            message=gen_result.message,
+            **total_stats,
+        )
+
+    logger.info(f"Testing {len(gen_result.candidates)} candidates in parallel")
+
+    work_items = [
+        (
+            gen_result.truncated_data,
+            c.n_value,
+            c.eocd_start,
+            c.cd_offset,
+            c.cd_size,
+            c.total_entries,
+            c.disk_num,
+            c.target_info,
+            expected_hash,
+        )
+        for c in gen_result.candidates
+    ]
+
+    if len(work_items) == 1:
+        success, result = extraction_worker(work_items[0])
+        stats = result["stats"]
+        total_stats["lfh_rejects"] += stats["lfh_rejects"]
+        total_stats["decompress_rejects"] += stats["decompress_rejects"]
+        total_stats["crc_rejects"] += stats["crc_rejects"]
+        total_stats["hash_rejects"] += stats["hash_rejects"]
+
+        if success:
+            elapsed = time.time() - start_time
+            logger.info(f"Recovery successful: N={result['n_value']}, "
+                       f"cd_offset={result['cd_offset']}, entries={result['total_entries']} "
+                       f"in {elapsed:.3f}s")
+            return RecoveryResult(
+                success=True,
+                n_value=result["n_value"],
+                recovered_data=result["data"],
+                sha256_hash=result["hash"],
+                message="Recovery successful",
+                **total_stats,
+            )
+    else:
+        with ProcessPoolExecutor(max_workers=num_jobs) as executor:
+            futures = {executor.submit(extraction_worker, item): item for item in work_items}
+
+            for future in as_completed(futures):
+                try:
+                    success, result = future.result()
+                except Exception:
+                    continue
+
+                stats = result["stats"]
+                total_stats["lfh_rejects"] += stats["lfh_rejects"]
+                total_stats["decompress_rejects"] += stats["decompress_rejects"]
+                total_stats["crc_rejects"] += stats["crc_rejects"]
+                total_stats["hash_rejects"] += stats["hash_rejects"]
+
+                if success:
+                    executor.shutdown(wait=False, cancel_futures=True)
+
+                    elapsed = time.time() - start_time
+                    logger.info(f"Recovery successful: N={result['n_value']}, "
+                               f"cd_offset={result['cd_offset']}, entries={result['total_entries']} "
+                               f"in {elapsed:.3f}s")
+                    return RecoveryResult(
+                        success=True,
+                        n_value=result["n_value"],
+                        recovered_data=result["data"],
+                        sha256_hash=result["hash"],
+                        message="Recovery successful",
+                        **total_stats,
+                    )
+
+    elapsed = time.time() - start_time
+    return RecoveryResult(
+        success=False,
+        message=f"No valid match after {len(gen_result.candidates)} extractions in {elapsed:.3f}s",
         **total_stats,
     )

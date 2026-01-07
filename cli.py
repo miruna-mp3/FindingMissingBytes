@@ -20,6 +20,8 @@ from .validator import (
 )
 from .logging_setup import setup_logging, get_logger
 from .truncate import truncate_archive, extract_and_hash_members, write_metadata_json
+from .recover import recover_member
+from .paths import resolve_output_path
 
 
 def cmd_truncate(args):
@@ -108,7 +110,7 @@ def cmd_recover(args):
 
     try:
         archive_path = resolve_archive_path(args.archive)
-        logger.info(f"Archive path: {archive_path}")
+        logger.info(f"Archive: {archive_path}")
     except PathSecurityError as e:
         logger.error(str(e))
         return 1
@@ -116,30 +118,10 @@ def cmd_recover(args):
         logger.error(str(e))
         return 1
 
-    try:
-        zip_info = validate_zip_file(archive_path)
-        logger.info(f"ZIP validated: {zip_info.total_entries} entries, {zip_info.file_size} bytes")
-    except ZipValidationError as e:
-        logger.error(str(e))
-        return 1
-    except UnsupportedZipError as e:
-        logger.error(str(e))
-        return 1
-
-    try:
-        member_entry = validate_member_exists(zip_info, args.member)
-        logger.info(f"Member found: {member_entry.filename}")
-        logger.info(f"  Compression: {'deflate' if member_entry.compression_method == 8 else 'stored'}")
-        logger.info(f"  Compressed size: {member_entry.compressed_size}")
-        logger.info(f"  Uncompressed size: {member_entry.uncompressed_size}")
-    except ZipValidationError as e:
-        logger.error(str(e))
-        return 1
-
     archive_basename = get_archive_basename(args.archive)
+
     try:
         hash_path = resolve_hash_path(archive_basename, args.member)
-        logger.info(f"Hash file path: {hash_path}")
     except PathSecurityError as e:
         logger.error(str(e))
         return 1
@@ -159,9 +141,42 @@ def cmd_recover(args):
         logger.error("--jobs must be at least 1")
         return 1
 
-    logger.info(f"Max missing bytes: {args.max_missing}")
-    logger.info(f"Worker jobs: {args.jobs}")
-    logger.info("Phase 1 complete: recovery logic will be implemented in Phase 3+")
+    try:
+        output_path = resolve_output_path(archive_basename, args.member)
+    except PathSecurityError as e:
+        logger.error(str(e))
+        return 1
+
+    result = recover_member(
+        truncated_path=archive_path,
+        target_member=args.member,
+        expected_hash=expected_hash,
+        max_missing=args.max_missing,
+        num_jobs=args.jobs,
+        logger=logger,
+    )
+
+    logger.info(f"Candidates tested: {result.candidates_tested}")
+    logger.info(f"CD rejects: {result.cd_rejects}")
+    logger.info(f"LFH rejects: {result.lfh_rejects}")
+    logger.info(f"CRC rejects: {result.crc_rejects}")
+    logger.info(f"Hash rejects: {result.hash_rejects}")
+
+    if not result.success:
+        logger.error(f"Recovery failed: {result.message}")
+        return 1
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.with_suffix(".tmp")
+
+    with open(temp_path, "wb") as f:
+        f.write(result.recovered_data)
+
+    temp_path.rename(output_path)
+
+    logger.info(f"Recovered: {output_path}")
+    logger.info(f"SHA-256: {result.sha256_hash}")
+    logger.info(f"N={result.n_value} bytes were missing")
 
     return 0
 
@@ -175,7 +190,7 @@ def main():
 
     truncate_parser = subparsers.add_parser(
         "truncate",
-        help="Create a truncated archive for testing",
+        help="Create a truncated archive for testing.",
     )
     truncate_parser.add_argument(
         "archive",
@@ -190,7 +205,7 @@ def main():
 
     recover_parser = subparsers.add_parser(
         "recover",
-        help="Recover a member from a (possibly truncated) archive",
+        help="Recover a member from a truncated archive",
     )
     recover_parser.add_argument(
         "archive",
