@@ -1,12 +1,15 @@
 import hashlib
 import os
 import struct
+import sys
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, List, Tuple
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import time
+
+from . import console
 
 
 # 0x00 / 4 / Signature = 50 4B 05 06 (“PK\x05\x06”)
@@ -265,6 +268,7 @@ def generate_candidates(
 
     truncated_size = len(truncated_data)
     logger.info(f"Truncated archive: {truncated_size} bytes")
+    print(f"  Truncated archive size: {truncated_size:,} bytes")
 
     disk_num = get_disk_number(truncated_path)
     logger.info(f"Disk number: {disk_num}")
@@ -272,6 +276,7 @@ def generate_candidates(
     valid_n_values = find_valid_n_values(truncated_data, max_missing)
 
     if not valid_n_values:
+        print("  No valid N values found (EOCD signature not found)")
         return GenerationResult(
             success=False,
             candidates=[],
@@ -280,6 +285,8 @@ def generate_candidates(
         )
 
     logger.info(f"Valid N values: {[n for n, _ in valid_n_values]}")
+    print(f"  Valid N values: {[n for n, _ in valid_n_values]}")
+    print()
 
     total_stats = {
         "candidates_tested": 0,
@@ -295,7 +302,9 @@ def generate_candidates(
         if not ranges:
             continue
 
-        logger.info(f"N={n}: {len(ranges)} workers, cd_offset range [0, {eocd_start - CD_ENTRY_MIN_SIZE}]")
+        max_offset = eocd_start - CD_ENTRY_MIN_SIZE
+        logger.info(f"N={n}: {len(ranges)} workers, cd_offset range [0, {max_offset}]")
+        console.print_generation_progress(n, len(ranges), (0, max_offset))
 
         work_items = [
             (truncated_data, n, eocd_start, start, end, disk_num, target_member)
@@ -310,6 +319,7 @@ def generate_candidates(
         else:
             with ProcessPoolExecutor(max_workers=len(work_items)) as executor:
                 futures = [executor.submit(worker_process_range, item) for item in work_items]
+                completed = 0
 
                 for future in as_completed(futures):
                     try:
@@ -317,11 +327,15 @@ def generate_candidates(
                         all_valid_candidates.extend(candidates)
                         for key in stats:
                             total_stats[key] += stats[key]
+                        completed += 1
+                        print(f"    Worker {completed}/{len(ranges)} done: {stats['candidates_tested']:,} tested, {len(candidates)} valid")
                     except Exception as e:
                         logger.debug(f"Worker exception: {e}")
 
     elapsed = time.time() - start_time
     logger.info(f"Candidate generation: {len(all_valid_candidates)} valid / {total_stats['candidates_tested']} tested in {elapsed:.3f}s")
+    print()
+    print(f"  Generation complete: {len(all_valid_candidates)} valid candidates in {elapsed:.2f}s")
 
     return GenerationResult(
         success=len(all_valid_candidates) > 0,
@@ -542,7 +556,10 @@ def recover_member(
             **total_stats,
         )
 
-    logger.info(f"Testing {len(gen_result.candidates)} candidates in parallel")
+    total_candidates = len(gen_result.candidates)
+    logger.info(f"Testing {total_candidates} candidates in parallel")
+    print()
+    print(f"  Extraction phase: {total_candidates} candidates with {num_jobs} workers")
 
     work_items = [
         (
@@ -560,6 +577,7 @@ def recover_member(
     ]
 
     if len(work_items) == 1:
+        print(f"    Testing candidate: N={gen_result.candidates[0].n_value}, cd_offset={gen_result.candidates[0].cd_offset}")
         success, result = extraction_worker(work_items[0])
         stats = result["stats"]
         total_stats["lfh_rejects"] += stats["lfh_rejects"]
@@ -572,6 +590,7 @@ def recover_member(
             logger.info(f"Recovery successful: N={result['n_value']}, "
                        f"cd_offset={result['cd_offset']}, entries={result['total_entries']} "
                        f"in {elapsed:.3f}s")
+            print(f"    Match found!")
             return RecoveryResult(
                 success=True,
                 n_value=result["n_value"],
@@ -582,7 +601,8 @@ def recover_member(
             )
     else:
         with ProcessPoolExecutor(max_workers=num_jobs) as executor:
-            futures = {executor.submit(extraction_worker, item): item for item in work_items}
+            futures = {executor.submit(extraction_worker, item): idx for idx, item in enumerate(work_items)}
+            tested = 0
 
             for future in as_completed(futures):
                 try:
@@ -590,14 +610,26 @@ def recover_member(
                 except Exception:
                     continue
 
+                tested += 1
                 stats = result["stats"]
                 total_stats["lfh_rejects"] += stats["lfh_rejects"]
                 total_stats["decompress_rejects"] += stats["decompress_rejects"]
                 total_stats["crc_rejects"] += stats["crc_rejects"]
                 total_stats["hash_rejects"] += stats["hash_rejects"]
 
+                if tested % 10 == 0 or tested == total_candidates:
+                    print(f"    Tested {tested}/{total_candidates} candidates...", end="\r")
+                    sys.stdout.flush()
+
                 if success:
+                    remaining = total_candidates - tested
+                    print(f"\n    Match found! Terminating {remaining} pending workers...")
+                    logger.info(f"Match found, cancelling {remaining} pending workers")
+
                     executor.shutdown(wait=False, cancel_futures=True)
+
+                    print(f"    Workers terminated cleanly.")
+                    logger.info("Workers terminated cleanly")
 
                     elapsed = time.time() - start_time
                     logger.info(f"Recovery successful: N={result['n_value']}, "
@@ -611,6 +643,8 @@ def recover_member(
                         message="Recovery successful",
                         **total_stats,
                     )
+
+            print()
 
     elapsed = time.time() - start_time
     return RecoveryResult(

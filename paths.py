@@ -3,6 +3,7 @@ from pathlib import Path
 
 ARCHIVES_DIR = Path("./archives")
 LOGS_DIR = Path("./logs")
+OUTPUT_DIR = Path("./output")
 
 
 class PathSecurityError(Exception):
@@ -16,6 +17,7 @@ class PathNotFoundError(Exception):
 def ensure_directories():
     ARCHIVES_DIR.mkdir(exist_ok=True)
     LOGS_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(exist_ok=True)
 
 
 def is_path_safe(path: Path, base: Path) -> bool:
@@ -90,9 +92,9 @@ def resolve_output_path(archive_basename: str, member_path: str) -> Path:
 
     member_path = member_path.lstrip("/")
 
-    path = ARCHIVES_DIR / f"{archive_basename}_recovered" / member_path
+    path = OUTPUT_DIR / f"{archive_basename}_recovered" / member_path
 
-    if not is_path_safe(path, ARCHIVES_DIR):
+    if not is_path_safe(path, OUTPUT_DIR):
         raise PathSecurityError(f"Path escapes workspace: {member_path}")
 
     return path

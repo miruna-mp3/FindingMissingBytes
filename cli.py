@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+import time
 
 from .paths import (
     PathSecurityError,
@@ -22,6 +23,7 @@ from .logging_setup import setup_logging, get_logger
 from .truncate import truncate_archive, extract_and_hash_members, write_metadata_json
 from .recover import recover_member
 from .paths import resolve_output_path
+from . import console
 
 
 def cmd_truncate(args):
@@ -107,45 +109,69 @@ def cmd_recover(args):
         str(args.jobs),
     ]
     logger = setup_logging("recover", arg_list)
+    start_time = time.time()
 
     try:
         archive_path = resolve_archive_path(args.archive)
         logger.info(f"Archive: {archive_path}")
     except PathSecurityError as e:
         logger.error(str(e))
+        print(f"Error: {e}")
         return 1
     except PathNotFoundError as e:
         logger.error(str(e))
+        print(f"Error: {e}")
         return 1
 
     archive_basename = get_archive_basename(args.archive)
 
-    try:
-        hash_path = resolve_hash_path(archive_basename, args.member)
-    except PathSecurityError as e:
-        logger.error(str(e))
-        return 1
+    if args.hash:
+        expected_hash = args.hash.lower().strip()
+        if len(expected_hash) != 64 or not all(c in "0123456789abcdef" for c in expected_hash):
+            logger.error("Invalid SHA-256 hash format")
+            print("Error: Invalid SHA-256 hash format (expected 64 hex characters)")
+            return 1
+        logger.info(f"Expected SHA-256 (from CLI): {expected_hash}")
+    else:
+        try:
+            hash_path = resolve_hash_path(archive_basename, args.member)
+        except PathSecurityError as e:
+            logger.error(str(e))
+            print(f"Error: {e}")
+            return 1
 
-    try:
-        expected_hash = read_expected_hash(hash_path)
-        logger.info(f"Expected SHA-256: {expected_hash}")
-    except ZipValidationError as e:
-        logger.error(str(e))
-        return 1
+        try:
+            expected_hash = read_expected_hash(hash_path)
+            logger.info(f"Expected SHA-256 (from sidecar): {expected_hash}")
+        except ZipValidationError as e:
+            logger.error(str(e))
+            print(f"Error: {e}")
+            return 1
 
     if args.max_missing < 1 or args.max_missing > 21:
         logger.error("--max-missing must be between 1 and 21")
+        print("Error: --max-missing must be between 1 and 21")
         return 1
 
     if args.jobs < 1:
         logger.error("--jobs must be at least 1")
+        print("Error: --jobs must be at least 1")
         return 1
 
     try:
         output_path = resolve_output_path(archive_basename, args.member)
     except PathSecurityError as e:
         logger.error(str(e))
+        print(f"Error: {e}")
         return 1
+
+    console.print_search_start(
+        archive=args.archive,
+        member=args.member,
+        expected_hash=expected_hash,
+        max_missing=args.max_missing,
+        num_jobs=args.jobs,
+    )
 
     result = recover_member(
         truncated_path=archive_path,
@@ -156,14 +182,27 @@ def cmd_recover(args):
         logger=logger,
     )
 
+    elapsed = time.time() - start_time
+
     logger.info(f"Candidates tested: {result.candidates_tested}")
     logger.info(f"CD rejects: {result.cd_rejects}")
     logger.info(f"LFH rejects: {result.lfh_rejects}")
+    logger.info(f"Decompress rejects: {result.decompress_rejects}")
     logger.info(f"CRC rejects: {result.crc_rejects}")
     logger.info(f"Hash rejects: {result.hash_rejects}")
 
+    stats = {
+        "candidates_tested": result.candidates_tested,
+        "cd_rejects": result.cd_rejects,
+        "lfh_rejects": result.lfh_rejects,
+        "decompress_rejects": result.decompress_rejects,
+        "crc_rejects": result.crc_rejects,
+        "hash_rejects": result.hash_rejects,
+    }
+
     if not result.success:
         logger.error(f"Recovery failed: {result.message}")
+        console.print_failure(result.message, elapsed, stats)
         return 1
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -177,6 +216,14 @@ def cmd_recover(args):
     logger.info(f"Recovered: {output_path}")
     logger.info(f"SHA-256: {result.sha256_hash}")
     logger.info(f"N={result.n_value} bytes were missing")
+
+    console.print_success(
+        output_path=str(output_path),
+        sha256=result.sha256_hash,
+        n_value=result.n_value,
+        elapsed=elapsed,
+        stats=stats,
+    )
 
     return 0
 
@@ -214,6 +261,12 @@ def main():
     recover_parser.add_argument(
         "member",
         help="Path of the member to recover within the archive",
+    )
+    recover_parser.add_argument(
+        "hash",
+        nargs="?",
+        default=None,
+        help="Expected SHA-256 hash (optional, defaults to reading from sidecar file)",
     )
     recover_parser.add_argument(
         "--max-missing",
