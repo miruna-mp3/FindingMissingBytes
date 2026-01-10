@@ -8,6 +8,17 @@ from typing import Optional, List, Tuple
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import time
 
+
+# 0x00 / 4 / Signature = 50 4B 05 06 (“PK\x05\x06”)
+# 0x04 / 2 / Number of this disk
+# 0x06 / 2 / Disk where central directory starts
+# 0x08 / 2 / # of central directory records on this disk
+# 0x0A / 2 / Total # of central directory records
+# 0x0C / 4 / Size of central directory (bytes)
+# 0x10 / 4 / Offset of start of central directory (from beginning of file)
+# 0x14 / 2 / Comment length (C)
+# 0x16 / C / Comment
+
 EOCD_SIGNATURE = b"PK\x05\x06"
 CD_SIGNATURE = b"PK\x01\x02"
 LFH_SIGNATURE = b"PK\x03\x04"
@@ -346,6 +357,9 @@ def build_eocd(cd_offset: int, cd_size: int, total_entries: int, disk_num: int) 
     )
 
 
+CHUNK_SIZE = 8192
+
+
 def try_extraction(
     candidate_data: bytes,
     target_info: dict,
@@ -397,11 +411,50 @@ def try_extraction(
 
     compressed_data = candidate_data[data_offset:data_offset + cd_compressed_size]
 
+    hasher = hashlib.sha256()
+    crc_value = 0
+    chunks = []
+    total_size = 0
+
     if cd_compression == 0:
-        decompressed_data = compressed_data
+        for i in range(0, len(compressed_data), CHUNK_SIZE):
+            chunk = compressed_data[i:i + CHUNK_SIZE]
+            total_size += len(chunk)
+
+            if total_size > cd_uncompressed_size:
+                stats["decompress_rejects"] = 1
+                return (False, None, "", stats)
+
+            crc_value = zlib.crc32(chunk, crc_value)
+            hasher.update(chunk)
+            chunks.append(chunk)
+
     elif cd_compression == 8:
         try:
-            decompressed_data = zlib.decompress(compressed_data, -zlib.MAX_WBITS)
+            decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+
+            for i in range(0, len(compressed_data), CHUNK_SIZE):
+                in_chunk = compressed_data[i:i + CHUNK_SIZE]
+                out_chunk = decompressor.decompress(in_chunk)
+
+                if out_chunk:
+                    total_size += len(out_chunk)
+
+                    if total_size > cd_uncompressed_size:
+                        stats["decompress_rejects"] = 1
+                        return (False, None, "", stats)
+
+                    crc_value = zlib.crc32(out_chunk, crc_value)
+                    hasher.update(out_chunk)
+                    chunks.append(out_chunk)
+
+            remaining = decompressor.flush()
+            if remaining:
+                total_size += len(remaining)
+                crc_value = zlib.crc32(remaining, crc_value)
+                hasher.update(remaining)
+                chunks.append(remaining)
+
         except zlib.error:
             stats["decompress_rejects"] = 1
             return (False, None, "", stats)
@@ -409,23 +462,20 @@ def try_extraction(
         stats["decompress_rejects"] = 1
         return (False, None, "", stats)
 
-    if len(decompressed_data) != cd_uncompressed_size:
+    if total_size != cd_uncompressed_size:
         stats["decompress_rejects"] = 1
         return (False, None, "", stats)
 
-    computed_crc = zlib.crc32(decompressed_data) & 0xFFFFFFFF
-    if computed_crc != cd_crc32:
+    if (crc_value & 0xFFFFFFFF) != cd_crc32:
         stats["crc_rejects"] = 1
         return (False, None, "", stats)
 
-    hasher = hashlib.sha256()
-    hasher.update(decompressed_data)
     computed_hash = hasher.hexdigest().lower()
-
     if computed_hash != expected_hash.lower():
         stats["hash_rejects"] = 1
         return (False, None, "", stats)
 
+    decompressed_data = b"".join(chunks)
     return (True, decompressed_data, computed_hash, stats)
 
 
